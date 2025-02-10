@@ -20,7 +20,7 @@
  */
 #include "dirtyJtagConfig.h"
 
-#if ( USB_CDC_UART_BRIDGE )
+#if ( CDC_UART_INTF_COUNT > 0 )
 
 #include <pico/stdlib.h>
 #include <hardware/dma.h>
@@ -31,7 +31,6 @@
 static uint8_t tx_bufs[2][TX_BUFFER_SIZE] __attribute__((aligned(TX_BUFFER_SIZE)));
 static struct uart_device
 {
-	uint index;
 	uart_inst_t *inst;
 	uint8_t *tx_buf;
 	volatile uint8_t rx_buf[RX_BUFFER_SIZE];
@@ -60,7 +59,7 @@ static uint n_bits(uint n)
 uint setup_usart_tx_dma(uart_inst_t *uart, void *tx_address, uint buffer_size)
 {
 	uint dma_chan = dma_claim_unused_channel(true);
-	// Tell the DMA to raise IRQ line 0 when the channel finishes a block
+	// Tell the DMA to raise IRQ line 1 when the channel finishes a block
 	dma_channel_set_irq1_enabled(dma_chan, true);
 	// enable DMA TX
 	hw_write_masked(&uart_get_hw(uart)->dmacr, 1 << UART_UARTDMACR_TXDMAE_LSB, UART_UARTDMACR_TXDMAE_BITS);
@@ -85,10 +84,10 @@ uint setup_usart_tx_dma(uart_inst_t *uart, void *tx_address, uint buffer_size)
 uint setup_usart_rx_dma(uart_inst_t *uart, volatile void *rx_address, irq_handler_t handler, uint buffer_size)
 {
 	uint dma_chan = dma_claim_unused_channel(true);
-	// Tell the DMA to raise IRQ line 0 when the channel finishes a block
+	// Tell the DMA to raise IRQ line 1 when the channel finishes a block
 	dma_channel_set_irq1_enabled(dma_chan, true);
 
-	// Configure the processor to run dma_handler() when DMA IRQ 0 is asserted
+	// Configure the processor to run dma_handler() when DMA IRQ 1 is asserted
 	irq_add_shared_handler(DMA_IRQ_1, handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
 	irq_set_enabled(DMA_IRQ_1, true);
 	// enable DMA RX
@@ -111,11 +110,11 @@ uint setup_usart_rx_dma(uart_inst_t *uart, volatile void *rx_address, irq_handle
 	return dma_chan;
 }
 
-void cdc_uart_init( uart_inst_t *const uart_, int uart_rx_pin, int uart_tx_pin )  {
+void cdc_uart_init( int index, uart_inst_t *const uart_, int uart_rx_pin, int uart_tx_pin )  {
 	uint uart_index;
 	uart_index = uart_get_index(uart_);
     struct uart_device *uart;
-	uart = &uart_devices[uart_index];
+	uart = &uart_devices[index];
 
 	gpio_set_function(uart_tx_pin, GPIO_FUNC_UART);
 	gpio_set_function(uart_rx_pin, GPIO_FUNC_UART);
@@ -123,7 +122,6 @@ void cdc_uart_init( uart_inst_t *const uart_, int uart_rx_pin, int uart_tx_pin )
 	gpio_set_pulls(uart_rx_pin, 1, 0);
 
 	uart->inst = uart_;
-	uart->index = uart_index;
 	uart_init(uart->inst, USBUSART_BAUDRATE);
 	uart_set_hw_flow(uart->inst, false, false);
 	uart_set_format(uart->inst, 8, 1, UART_PARITY_NONE);
@@ -143,14 +141,15 @@ static void dma_handler()
 	volatile uint32_t ints = dma_hw->ints1;
 	struct uart_device *uart;
 
-	for (size_t i = 0; i < PIN_UART_INTF_COUNT; i++)
+	for (size_t i = 0; i < CDC_UART_INTF_COUNT; i++)
 	{
 		uart = &uart_devices[i];
-		if (ints & (1 << uart->rx_dma_channel)) //dma_channel_hw_addr(rx_dma_channel)->transfer_count == 0) // dma_channel_get_irq1_status(rx_dma_channel))
+		
+		if (dma_channel_get_irq1_status(uart->rx_dma_channel))
 		{
 			dma_channel_set_write_addr(uart->rx_dma_channel, &uart->rx_buf[0], true);
 		}
-		if (ints & (1 << uart->tx_dma_channel)) //(dma_channel_hw_addr(tx_dma_channel)->transfer_count == 0) // (dma_channel_get_irq1_status(tx_dma_channel))
+		if (dma_channel_get_irq1_status(uart->tx_dma_channel))
 		{
 			uint8_t *ra = (uint8_t *)(dma_channel_hw_addr(uart->tx_dma_channel)->read_addr);
 			// cdc_uart_task can modify uart->tx_write_address. cache it locally
@@ -172,10 +171,10 @@ void cdc_uart_task(void)
 
 	struct uart_device *uart;
 
-	for (size_t i = 0; i < PIN_UART_INTF_COUNT; i++)
+	for (size_t i = 0; i < CDC_UART_INTF_COUNT; i++)
 	{
 		uart = &uart_devices[i];
-		if (tud_cdc_n_connected(uart->index))
+		if (tud_cdc_n_connected(i))
 		{
 			uart->is_connected = 1;
 			int written = 0;
@@ -190,13 +189,13 @@ void cdc_uart_task(void)
 			{
 				led_tx( 1 );
 				uart->n_checks = 0;
-				uint32_t capacity = tud_cdc_n_write_available(uart->index);
+				uint32_t capacity = tud_cdc_n_write_available(i);
 				uint32_t size_out = MIN(space, capacity);
 				if (capacity >= FULL_SWO_PACKET)
 				{
-					uint32_t written = tud_cdc_n_write(uart->index, uart->rx_read_address, size_out);
+					uint32_t written = tud_cdc_n_write(i, uart->rx_read_address, size_out);
 					if (space < FULL_SWO_PACKET)
-						tud_cdc_n_write_flush(uart->index);
+						tud_cdc_n_write_flush(i);
 					tud_task();
 					uart->rx_read_address += written;
 					if (uart->rx_read_address >= &uart->rx_buf[RX_BUFFER_SIZE])
@@ -204,13 +203,13 @@ void cdc_uart_task(void)
 				}
 				led_tx( 0 );
 			}
-			uint ra = tud_cdc_n_available(uart->index);
+			uint ra = tud_cdc_n_available(i);
 			size_t watermark = MIN(ra, &uart->tx_buf[TX_BUFFER_SIZE] - uart->tx_write_address);
 			if (watermark > 0)
 			{
 				led_rx( 1 );
 				size_t tx_len;
-				tx_len = tud_cdc_n_read(uart->index, (void*)uart->tx_write_address, watermark);
+				tx_len = tud_cdc_n_read(i, (void*)uart->tx_write_address, watermark);
 				//be careful about modifying tx_write_address as it is used in the IRQ handler
 				volatile uint8_t *l_tx_write_address = uart->tx_write_address + tx_len;
 				if (l_tx_write_address >= &uart->tx_buf[TX_BUFFER_SIZE])
@@ -230,7 +229,7 @@ void cdc_uart_task(void)
 		}
 		else if (uart->is_connected)
 		{
-			tud_cdc_n_write_clear(uart->index);
+			tud_cdc_n_write_clear(i);
 			uart->is_connected = 0;
 		}
 	}
@@ -240,10 +239,10 @@ void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* line_coding)
 {
 	struct uart_device *uart;
 
-	for (size_t i = 0; i < PIN_UART_INTF_COUNT; i++)
+	for (size_t i = 0; i < CDC_UART_INTF_COUNT; i++)
 	{
 		uart = &uart_devices[i];
-		if (uart->index == itf)
+		if (i == itf)
 		{
 			uart_deinit(uart->inst);
 			tud_cdc_n_write_clear(itf);
@@ -267,4 +266,4 @@ void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
 	// 	cdc_stopped = false;
 }
 
-#endif // USB_CDC_UART_BRIDGE
+#endif // CDC_UART_INTF_COUNT
